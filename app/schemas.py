@@ -178,3 +178,74 @@ class CheckResponse(BaseModel):
     tolerance: float
     samples: list[SampleBalance]
     conflicts: list[Conflict] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------- 预留
+
+class ReservationItemIn(BaseModel):
+    """预留明细:为指定样品锁定 amount,单位沿用样品主数据。"""
+
+    sample_id: str = Field(min_length=1)
+    amount: Amount
+
+
+class ReservationRequest(BaseModel):
+    """创建预留单:同一预留号对多个样品分别锁定数量。"""
+
+    reservation_no: str = Field(min_length=1, description="预留号(幂等键),全局唯一")
+    items: list[ReservationItemIn] = Field(min_length=1)
+    note: Optional[str] = Field(default=None, description="备注,仅用于审计展示")
+
+    @model_validator(mode="after")
+    def _check_items(self) -> "ReservationRequest":
+        ids = [i.sample_id for i in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("items 中存在重复 sample_id")
+        return self
+
+
+class ReservationItemOut(BaseModel):
+    sample_id: str
+    amount: float
+    unit: str
+    remaining: float = Field(description="样品当前余量(冗余余量)")
+    reserved: float = Field(description="该样品未释放预留的锁定总量(含本单)")
+    available: float = Field(description="可用量 = 当前余量 - 未释放预留")
+
+
+class ReservationResult(BaseModel):
+    reservation_no: str
+    status: Literal["active", "released"]
+    items: list[ReservationItemOut]
+    note: Optional[str] = None
+    replayed: bool = Field(
+        default=False, description="True 表示命中预留号幂等,返回首次结果"
+    )
+    created_at: Optional[str] = None
+    released_at: Optional[str] = None
+
+
+class ReleaseResult(BaseModel):
+    reservation_no: str
+    status: Literal["released"]
+    items: list[ReservationItemOut] = Field(
+        description="释放后各样品的余量/已预留/可用量"
+    )
+    note: Optional[str] = None
+    replayed: bool = Field(
+        default=False, description="对已释放预留号再次释放时为 True"
+    )
+    created_at: Optional[str] = None
+    released_at: Optional[str] = None
+
+
+class SampleAvailability(BaseModel):
+    sample_id: str
+    unit: str
+    remaining: float = Field(description="当前余量")
+    reserved: float = Field(description="未释放预留的锁定总量")
+    available: float = Field(description="可用量 = 当前余量 - 已预留量")
+
+
+class AvailabilityResponse(BaseModel):
+    samples: list[SampleAvailability]

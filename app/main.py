@@ -10,6 +10,7 @@ from fastapi import Depends, FastAPI, Query
 from fastapi.responses import JSONResponse
 
 from . import schemas as s
+from . import reservations as rsv
 from . import service
 from .config import BALANCE_TOLERANCE, DB_PATH
 from .db import connect, get_conn, init_db
@@ -33,7 +34,10 @@ app = FastAPI(
         "- 每个操作带全局唯一操作号,重复提交幂等返回原结果\n"
         "- 事务内校验父样品余量、禁止谱系环路\n"
         "- 支持批量提交与 dry-run 预校验,冲突返回操作号与批内定位\n"
-        "- 按样品回溯完整来源/去向,并提供余量(账本)校验"
+        "- 按样品回溯完整来源/去向,并提供余量(账本)校验\n"
+        "- 预留模块:一个预留号为多个样品分别锁定数量,\n"
+        "  单事务校验各样品可用量(余量-未释放预留),全部足够才创建,\n"
+        "  支持按预留号幂等重放与整单释放"
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -46,6 +50,21 @@ async def conflict_handler(_request, exc: service.ConflictError) -> JSONResponse
         status_code=409,
         content={
             "error": "conflict",
+            "conflicts": [c.model_dump() for c in exc.conflicts],
+        },
+    )
+
+
+@app.exception_handler(rsv.ReservationError)
+async def reservation_error_handler(
+    _request, exc: rsv.ReservationError
+) -> JSONResponse:
+    code = exc.conflicts[0].code if exc.conflicts else "reservation_error"
+    status_code = 404 if code == "reservation_not_found" else 409
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": "reservation_not_found" if status_code == 404 else "conflict",
             "conflicts": [c.model_dump() for c in exc.conflicts],
         },
     )
@@ -308,3 +327,59 @@ def get_operation(
         "location": row["location"],
         "created_at": row["created_at"],
     }
+
+
+# ---------------------------------------------------------------- 预留
+
+@app.post(
+    "/api/v1/reservations",
+    response_model=s.ReservationResult,
+    tags=["预留"],
+    summary="创建预留:一个预留号为多个样品分别锁定数量,全部足够才一次创建",
+)
+def create_reservation(
+    body: s.ReservationRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.ReservationResult:
+    return rsv.create_reservation(conn, body)
+
+
+@app.get(
+    "/api/v1/reservations/{reservation_no}",
+    response_model=s.ReservationResult,
+    tags=["预留"],
+    summary="按预留号查询预留单及各样品当前余量/已预留/可用量",
+)
+def get_reservation(
+    reservation_no: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.ReservationResult:
+    return rsv.get_reservation(conn, reservation_no)
+
+
+@app.delete(
+    "/api/v1/reservations/{reservation_no}",
+    response_model=s.ReleaseResult,
+    tags=["预留"],
+    summary="主动释放整单预留(幂等:重复释放返回原释放结果)",
+)
+def release_reservation(
+    reservation_no: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.ReleaseResult:
+    return rsv.release_reservation(conn, reservation_no)
+
+
+@app.get(
+    "/api/v1/reservations",
+    response_model=s.AvailabilityResponse,
+    tags=["预留"],
+    summary="样品可用量查询:当前余量、已预留量与可用量(可用量 = 余量 - 未释放预留)",
+)
+def query_availability(
+    sample_id: Optional[list[str]] = Query(
+        default=None, description="可重复传入,如 ?sample_id=S1&sample_id=S2;不传返回全部"
+    ),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.AvailabilityResponse:
+    return rsv.get_availability(conn, sample_id)

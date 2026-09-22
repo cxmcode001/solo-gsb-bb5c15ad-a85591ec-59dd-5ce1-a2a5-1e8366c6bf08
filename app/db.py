@@ -67,6 +67,45 @@ CREATE TABLE IF NOT EXISTS lineage_edges (
 CREATE INDEX IF NOT EXISTS idx_edges_parent ON lineage_edges(parent_id);
 CREATE INDEX IF NOT EXISTS idx_edges_child  ON lineage_edges(child_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_sample ON ledger_entries(sample_id);
+
+-- 预留单:一个预留号为多个样品分别锁定数量;active=锁定中,released=已整单释放
+CREATE TABLE IF NOT EXISTS reservations (
+    reservation_no TEXT PRIMARY KEY,
+    status         TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'released')),
+    payload        TEXT NOT NULL,
+    note           TEXT,
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    released_at    TEXT
+);
+
+-- 预留明细:同一预留单内每个样品至多一条(UNIQUE 兜底)
+CREATE TABLE IF NOT EXISTS reservation_items (
+    item_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation_no TEXT NOT NULL,
+    sample_id      TEXT NOT NULL,
+    amount         REAL NOT NULL CHECK (amount > 0),
+    unit           TEXT NOT NULL,
+    seq_index      INTEGER NOT NULL,
+    FOREIGN KEY (reservation_no) REFERENCES reservations(reservation_no),
+    FOREIGN KEY (sample_id)      REFERENCES samples(sample_id),
+    UNIQUE (reservation_no, sample_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ritems_reservation ON reservation_items(reservation_no);
+CREATE INDEX IF NOT EXISTS idx_ritems_sample      ON reservation_items(sample_id);
+
+-- 预留审计事件:预留 / 幂等重放 / 释放 / 查询的结果快照均持久化
+CREATE TABLE IF NOT EXISTS reservation_events (
+    event_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation_no TEXT,
+    action         TEXT NOT NULL CHECK (action IN ('reserve', 'replay', 'release', 'query')),
+    ref_id         TEXT,
+    detail         TEXT NOT NULL,
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    FOREIGN KEY (reservation_no) REFERENCES reservations(reservation_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_revents_reservation ON reservation_events(reservation_no);
 """
 
 
