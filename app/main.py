@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, Query
 from fastapi.responses import JSONResponse
 
 from . import schemas as s
-from . import service
+from . import reservations, service
 from .config import BALANCE_TOLERANCE, DB_PATH
 from .db import connect, get_conn, init_db
 
@@ -33,9 +33,11 @@ app = FastAPI(
         "- 每个操作带全局唯一操作号,重复提交幂等返回原结果\n"
         "- 事务内校验父样品余量、禁止谱系环路\n"
         "- 支持批量提交与 dry-run 预校验,冲突返回操作号与批内定位\n"
-        "- 按样品回溯完整来源/去向,并提供余量(账本)校验"
+        "- 按样品回溯完整来源/去向,并提供余量(账本)校验\n"
+        "- 预留模块:一个预留号为多个样品在同一事务中锁定数量,"
+        "支持幂等重放、整单释放与余量/已预留/可用量查询"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -308,3 +310,72 @@ def get_operation(
         "location": row["location"],
         "created_at": row["created_at"],
     }
+
+
+# ---------------------------------------------------------------- 预留
+
+@app.post(
+    "/api/v1/reservations",
+    response_model=s.ReserveResult,
+    tags=["预留"],
+    summary="用一个预留号为多个样品分别锁定数量,全部足够才一次创建",
+)
+def create_reservation(
+    body: s.ReservationRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.ReserveResult:
+    return reservations.reserve(conn, body)
+
+
+@app.get(
+    "/api/v1/reservations/{reservation_no}",
+    response_model=s.ReserveResult,
+    tags=["预留"],
+    summary="按预留号查询预留单当前状态与明细",
+)
+def get_reservation(
+    reservation_no: str, conn: sqlite3.Connection = Depends(get_conn)
+):
+    result = reservations.get_reservation(conn, reservation_no)
+    if result is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "not_found",
+                "message": f"预留号 {reservation_no} 不存在",
+            },
+        )
+    return result
+
+
+@app.post(
+    "/api/v1/reservations/{reservation_no}/release",
+    response_model=s.ReleaseResult,
+    tags=["预留"],
+    summary="主动释放整单预留(已释放则幂等重放)",
+)
+def release_reservation(
+    reservation_no: str, conn: sqlite3.Connection = Depends(get_conn)
+):
+    result = reservations.release(conn, reservation_no)
+    if result is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "not_found",
+                "message": f"预留号 {reservation_no} 不存在",
+            },
+        )
+    return result
+
+
+@app.get(
+    "/api/v1/samples/{sample_id}/availability",
+    response_model=s.SampleAvailability,
+    tags=["预留"],
+    summary="查询样品当前余量 / 已预留量 / 可用量",
+)
+def sample_availability(
+    sample_id: str, conn: sqlite3.Connection = Depends(get_conn)
+) -> s.SampleAvailability:
+    return reservations.get_availability(conn, sample_id)

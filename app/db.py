@@ -67,6 +67,44 @@ CREATE TABLE IF NOT EXISTS lineage_edges (
 CREATE INDEX IF NOT EXISTS idx_edges_parent ON lineage_edges(parent_id);
 CREATE INDEX IF NOT EXISTS idx_edges_child  ON lineage_edges(child_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_sample ON ledger_entries(sample_id);
+
+-- 预留单:reservation_no 为幂等键,整单一次创建、可整单释放
+CREATE TABLE IF NOT EXISTS reservations (
+    reservation_no TEXT PRIMARY KEY,
+    status         TEXT NOT NULL DEFAULT 'active'
+                   CHECK (status IN ('active', 'released')),
+    payload        TEXT NOT NULL,
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    released_at    TEXT
+);
+
+-- 预留明细:每张预留单对每个样品锁定一行数量
+CREATE TABLE IF NOT EXISTS reservation_items (
+    reservation_no TEXT NOT NULL,
+    sample_id      TEXT NOT NULL,
+    amount         REAL NOT NULL CHECK (amount > 0),
+    unit           TEXT NOT NULL,
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (reservation_no, sample_id),
+    FOREIGN KEY (reservation_no) REFERENCES reservations(reservation_no),
+    FOREIGN KEY (sample_id)      REFERENCES samples(sample_id)
+);
+
+-- 预留事件流水:预留/释放的持久化结果,支撑幂等回放与审计
+CREATE TABLE IF NOT EXISTS reservation_events (
+    event_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation_no TEXT NOT NULL,
+    event_type     TEXT NOT NULL CHECK (event_type IN ('reserve', 'release')),
+    payload        TEXT NOT NULL,
+    effect         TEXT NOT NULL,
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    FOREIGN KEY (reservation_no) REFERENCES reservations(reservation_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_resitems_sample
+    ON reservation_items(sample_id);
+CREATE INDEX IF NOT EXISTS idx_resevents_resno
+    ON reservation_events(reservation_no);
 """
 
 

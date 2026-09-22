@@ -178,3 +178,66 @@ class CheckResponse(BaseModel):
     tolerance: float
     samples: list[SampleBalance]
     conflicts: list[Conflict] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------- 预留
+
+class ReservationItemIn(BaseModel):
+    """一张预留单内对单个样品锁定的数量。"""
+
+    sample_id: str = Field(min_length=1)
+    amount: Amount
+
+
+class ReservationRequest(BaseModel):
+    """用一个预留号为多个样品分别锁定数量。"""
+
+    reservation_no: str = Field(min_length=1, description="预留号(幂等键),整单唯一")
+    items: list[ReservationItemIn] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _check_items(self) -> "ReservationRequest":
+        ids = [i.sample_id for i in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("items 中存在重复 sample_id,同一预留单对一个样品只能有一行")
+        return self
+
+
+class ReservationItemOut(BaseModel):
+    sample_id: str
+    amount: float
+    unit: str
+    remaining: Optional[float] = Field(
+        default=None, description="提交/释放后该样品的当前余量"
+    )
+    reserved: Optional[float] = Field(
+        default=None, description="提交/释放后该样品的未释放预留总量"
+    )
+    available: Optional[float] = Field(
+        default=None, description="提交/释放后该样品的可用量(余量-已预留)"
+    )
+
+
+class ReserveResult(BaseModel):
+    reservation_no: str
+    status: Literal["active", "released"]
+    items: list[ReservationItemOut]
+    replayed: bool = Field(default=False, description="True 表示命中预留号幂等,回放首次结果")
+    created_at: Optional[str] = None
+    released_at: Optional[str] = None
+
+
+class ReleaseResult(BaseModel):
+    reservation_no: str
+    status: Literal["released"]
+    released_items: list[ReservationItemOut]
+    replayed: bool = Field(default=False, description="预留单已是 released 状态时为 True")
+    released_at: Optional[str] = None
+
+
+class SampleAvailability(BaseModel):
+    sample_id: str
+    unit: str
+    remaining: float = Field(description="当前余量")
+    reserved: float = Field(description="未释放预留总量")
+    available: float = Field(description="可用量 = 当前余量 - 已预留")

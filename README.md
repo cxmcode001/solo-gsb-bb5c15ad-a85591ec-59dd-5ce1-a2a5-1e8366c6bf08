@@ -64,6 +64,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET  | `/api/v1/samples/{id}/balance` | 单个样品余量账本校验 |
 | GET  | `/api/v1/checks/balances` | 全量余量一致性校验,返回全部冲突及定位 |
 | GET  | `/api/v1/operations/{op_no}` | 按操作号取首次提交的原始结果(幂等凭证) |
+| POST | `/api/v1/reservations` | 预留:一个预留号为多个样品在同一事务中锁定数量 |
+| GET  | `/api/v1/reservations/{no}` | 按预留号查询预留单当前状态与明细 |
+| POST | `/api/v1/reservations/{no}/release` | 主动释放整单预留(已释放则幂等重放) |
+| GET  | `/api/v1/samples/{id}/availability` | 样品当前余量 / 已预留量 / 可用量 |
 | GET  | `/health` | 健康检查 |
 
 ## 使用示例
@@ -192,6 +196,62 @@ curl -X POST http://localhost:8000/api/v1/batch/validate \
 # 预校验基于内存快照执行,主库不会被写入
 ```
 
+## 预留模块
+
+在样品实际分装/合并之前,可先用一个**预留号**为多个样品分别锁定数量(例如预约一管血样的若干用量)。核心规则:
+
+- **整单事务**:`POST /api/v1/reservations` 在单个 `BEGIN IMMEDIATE` 事务中逐个检查每个样品的**可用量 = 当前余量 − 未释放预留总量**;全部足够才一次写入预留单与明细,任一样品不存在或可用量不足则**整单失败、回滚,不改变任何预留**(冲突一次性全部返回)。
+- **幂等重放**:预留号是幂等键,同号同请求体重放返回首次结果(`replayed: true`),不会重复锁定;同号不同内容返回 `409 reservation_no_conflict`。预留单被释放后重放,返回首次预留内容但状态为 `released`。
+- **整单释放**:`POST /api/v1/reservations/{no}/release` 删除该单全部锁定明细、把预留单置为 `released`;重复释放幂等返回首次释放结果。释放后容量立即可供新预留使用。
+- **查询**:`GET /api/v1/samples/{id}/availability` 返回样品当前余量 `remaining`、已预留量 `reserved` 与可用量 `available`;`GET /api/v1/reservations/{no}` 返回预留单状态与明细。
+- **持久化**:预留单(`reservations`)、明细(`reservation_items`)与预留/释放事件流水(`reservation_events`)均由建表脚本创建,容器启动 lifespan 自动初始化并随 Docker 卷 `/data` 持久化;事件流水支撑幂等回放与审计。
+
+### 8. 一张预留单锁定多个样品
+
+```bash
+curl -X POST http://localhost:8000/api/v1/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reservation_no": "RES-20260922-001",
+    "items": [
+      {"sample_id": "S0", "amount": 30},
+      {"sample_id": "A1", "amount": 20}
+    ]
+  }'
+```
+
+```json
+{
+  "reservation_no": "RES-20260922-001",
+  "status": "active",
+  "replayed": false,
+  "items": [
+    {"sample_id": "S0", "amount": 30.0, "unit": "mL",
+     "remaining": 100.0, "reserved": 30.0, "available": 70.0},
+    {"sample_id": "A1", "amount": 20.0, "unit": "mL",
+     "remaining": 60.0, "reserved": 20.0, "available": 40.0}
+  ],
+  "created_at": "2026-09-22T08:00:00.000Z",
+  "released_at": null
+}
+```
+
+若其中任一数量超过可用量(当前余量减去所有未释放预留),整单返回 `409`,`conflicts[]` 给出每个不足或不存在的样品(`insufficient_available` / `sample_not_found`),且不写入任何明细。
+
+### 9. 查询可用量、释放整单
+
+```bash
+# 余量 / 已预留 / 可用
+curl http://localhost:8000/api/v1/samples/S0/availability
+# {"sample_id": "S0", "unit": "mL",
+#  "remaining": 100.0, "reserved": 30.0, "available": 70.0}
+
+# 主动释放整张预留单(重复调用幂等)
+curl -X POST http://localhost:8000/api/v1/reservations/RES-20260922-001/release
+# {"reservation_no": "...", "status": "released", "replayed": false,
+#  "released_items": [...释放后重算的 remaining/reserved/available...]}
+```
+
 ## 冲突码
 
 | code | 含义 |
@@ -207,6 +267,8 @@ curl -X POST http://localhost:8000/api/v1/batch/validate \
 | `op_no_conflict` | 操作号已存在但请求内容不同(幂等键冲突) |
 | `duplicate_op_no_in_batch` | 同一批次内操作号重复,附 `batch_index` |
 | `balance_inconsistent` | 余量账本重算与冗余余量不一致 |
+| `insufficient_available` | 预留时可用量(余量-未释放预留)不足,附 `requested`/`available` |
+| `reservation_no_conflict` | 预留号已存在但请求内容不同(幂等键冲突) |
 
 ## 运行测试
 
@@ -219,13 +281,15 @@ python -m pytest -q
 
 ```
 app/
-  config.py    # 数据库路径、容差等配置
-  db.py        # SQLite 连接 / 建表(WAL、外键、CHECK 约束)
-  schemas.py   # Pydantic 请求与响应模型(含冲突结构)
-  service.py   # 核心:事务提交、余量/环路校验、幂等回放、dry-run、递归回溯、账本审计
-  main.py      # FastAPI 路由
+  config.py       # 数据库路径、容差等配置
+  db.py           # SQLite 连接 / 建表(WAL、外键、CHECK 约束、预留表)
+  schemas.py      # Pydantic 请求与响应模型(含冲突结构、预留模型)
+  service.py      # 核心:事务提交、余量/环路校验、幂等回放、dry-run、递归回溯、账本审计
+  reservations.py # 预留:整单事务锁定、幂等重放、整单释放、余量/已预留/可用量查询
+  main.py         # FastAPI 路由
 tests/
-  test_api.py  # 端到端测试(TestClient)
+  test_api.py          # 端到端测试(TestClient)
+  test_reservations.py # 预留模块端到端测试
 Dockerfile
 docker-compose.yml
 ```
